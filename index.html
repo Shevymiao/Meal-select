@@ -403,17 +403,19 @@
   </div>
 
 <script>
+
 (() => {
   // =========================
-  // Data model
+  // V4: Casino roulette physics + ball + smarter AI weighting
+  // UI/DOM/CSS unchanged.
   // =========================
-  // Each item: { id, name, type, baseW, cooldown } where cooldown in [0..10]
-  // Effective multiplier from cooldown:
-  //   factor(c) = p + (1-p) * (c/10)
-  //   c=0 => p (just picked)
-  //   c=10 => 1.0 (fully recovered)
-  const RECOVERY_SPINS = 10;
-  const PENALTY_P = 0.60;
+
+  // -------------------------
+  // AI weighting model
+  // -------------------------
+  const RECOVERY_SPINS = 10;    // recover over 10 spins
+  const PENALTY_P = 0.60;       // immediately after pick, keep 60% of weight
+  const STORAGE_KEY = "ai_meal_roulette_v4";
 
   const TYPE_LABEL = {
     train: "訓練日",
@@ -422,9 +424,32 @@
     any: "通用"
   };
 
-  // Default dataset (你前面提供 + 我整理的健康組合)
+  function uid(){
+    return Math.random().toString(16).slice(2) + Date.now().toString(16);
+  }
+
+  function clamp01(x){ return Math.min(1, Math.max(0, x)); }
+
+  // Logistic recovery: slow-then-fast feel, hits ~1.0 by 10
+  function cooldownFactor(c){
+    const t = clamp01(c / RECOVERY_SPINS);            // 0..1
+    const k = 7.2;                                    // steepness
+    const x = (t - 0.5);                              // center at 0.5
+    const s = 1 / (1 + Math.exp(-k * x));             // 0..1
+    return PENALTY_P + (1 - PENALTY_P) * s;           // PENALTY_P..1
+  }
+
+  function normalizeAngle(a){
+    const tau = Math.PI * 2;
+    a %= tau;
+    if(a < 0) a += tau;
+    return a;
+  }
+
+  // -------------------------
+  // Default dataset
+  // -------------------------
   const DEFAULT_ITEMS = [
-    // 連鎖健康餐盒
     ["舒肥雞胸肉餐盒（半飯或飯換菜）","train"],
     ["蒜泥豬里肌餐盒（半飯或飯換菜）","diet"],
     ["鹽烤鯖魚餐盒（半飯或飯換菜）","train"],
@@ -432,7 +457,6 @@
     ["香料烤雞腿餐盒（去皮，半飯或飯換菜）","train"],
     ["清蒸鯛魚片餐盒（半飯或飯換菜）","diet"],
 
-    // 傳統小吃
     ["清燉牛肉湯（加滷花干）","diet"],
     ["豬肝湯＋兩份燙青菜（青菜不加肉燥）","diet"],
     ["嘴邊肉盤＋燙青菜","diet"],
@@ -441,7 +465,6 @@
     ["加熱滷味（豆干＋海帶＋三樣以上蔬菜）","diet"],
     ["鹹水雞（去皮，雞胸＋小黃瓜＋花椰菜＋木耳）","diet"],
 
-    // 火鍋與湯
     ["個人小火鍋（昆布底，低脂牛＋蔬菜＋豆腐）","lowcarb"],
     ["個人小火鍋（昆布底，雞肉＋蔬菜＋豆腐）","lowcarb"],
     ["番茄蔬菜燉牛肉","train"],
@@ -449,14 +472,12 @@
     ["香菇雞湯（去皮）＋燙青菜","lowcarb"],
     ["麻油雞湯（去皮）＋燙青菜","lowcarb"],
 
-    // 日式與現代輕食
     ["綜合刺身定食（飯減半或改沙拉）","train"],
     ["鹽烤鮮魚定食（竹筴魚或花魚，飯減半）","train"],
     ["烤雞肉串（鹽烤，避開醬燒）","train"],
     ["自選 Poke Bowl（全生菜＋鮪魚＋毛豆＋豆腐）","train"],
     ["自選 Poke Bowl（全生菜＋燻雞＋毛豆＋豆腐）","train"],
 
-    // 你原本清單的好選項
     ["雞肉藜麥碗","train"],
     ["烤雞沙拉","diet"],
     ["鯖魚定食","train"],
@@ -469,10 +490,14 @@
     ["無糖優格＋水果＋燕麥（份量控制）","any"]
   ];
 
-  const STORAGE_KEY = "ai_meal_roulette_v3";
-
-  function uid(){
-    return Math.random().toString(16).slice(2) + Date.now().toString(16);
+  function buildDefault(){
+    return DEFAULT_ITEMS.map(([name,type]) => ({
+      id: uid(),
+      name,
+      type,
+      baseW: 1,
+      cooldown: RECOVERY_SPINS
+    }));
   }
 
   function loadState(){
@@ -487,26 +512,9 @@
     }
   }
 
-  function saveState(){
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      dayType,
-      items
-    }));
-  }
-
-  function buildDefault(){
-    return DEFAULT_ITEMS.map(([name,type]) => ({
-      id: uid(),
-      name,
-      type,
-      baseW: 1,
-      cooldown: RECOVERY_SPINS
-    }));
-  }
-
-  // =========================
-  // UI elements
-  // =========================
+  // -------------------------
+  // UI elements (keep unchanged)
+  // -------------------------
   const canvas = document.getElementById("wheel");
   const ctx = canvas.getContext("2d");
 
@@ -531,9 +539,9 @@
   const soundOn = document.getElementById("soundOn");
   const noRepeat = document.getElementById("noRepeat");
 
-  // =========================
+  // -------------------------
   // State
-  // =========================
+  // -------------------------
   let dayType = "train";
   let items = buildDefault();
 
@@ -551,12 +559,18 @@
     }
   }
 
-  // =========================
-  // Casino sound (WebAudio)
-  // =========================
+  function saveState(){
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      dayType,
+      items
+    }));
+  }
+
+  // -------------------------
+  // Audio (WebAudio tick + win)
+  // -------------------------
   let audioCtx = null;
   let masterGain = null;
-  let lastTickAt = 0;
 
   function ensureAudio(){
     if(!soundOn.checked) return;
@@ -569,7 +583,7 @@
     masterGain.connect(audioCtx.destination);
   }
 
-  function clickSound(strength){
+  function clickSound(intensity){
     if(!soundOn.checked) return;
     ensureAudio();
     if(!audioCtx) return;
@@ -578,15 +592,15 @@
     const osc = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
 
-    const freq = 1100 + Math.random()*200;
-    osc.frequency.setValueAtTime(freq, now);
+    const base = 980 + Math.random()*220;
     osc.type = "square";
+    osc.frequency.setValueAtTime(base, now);
 
-    const a = 0.002;
-    const d = 0.03 + 0.05*strength;
+    const a = 0.0015;
+    const d = 0.028 + 0.05*intensity;
 
     gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.exponentialRampToValueAtTime(0.25, now + a);
+    gain.gain.exponentialRampToValueAtTime(0.22, now + a);
     gain.gain.exponentialRampToValueAtTime(0.0001, now + a + d);
 
     osc.connect(gain);
@@ -602,42 +616,45 @@
     if(!audioCtx) return;
 
     const now = audioCtx.currentTime;
-    const osc = audioCtx.createOscillator();
+
+    const osc1 = audioCtx.createOscillator();
+    const osc2 = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
 
-    osc.type = "sine";
-    osc.frequency.setValueAtTime(660, now);
-    osc.frequency.exponentialRampToValueAtTime(990, now + 0.12);
+    osc1.type = "sine";
+    osc2.type = "triangle";
+
+    osc1.frequency.setValueAtTime(660, now);
+    osc1.frequency.exponentialRampToValueAtTime(990, now + 0.12);
+
+    osc2.frequency.setValueAtTime(330, now);
+    osc2.frequency.exponentialRampToValueAtTime(495, now + 0.12);
 
     gain.gain.setValueAtTime(0.0001, now);
     gain.gain.exponentialRampToValueAtTime(0.35, now + 0.01);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.28);
 
-    osc.connect(gain);
+    osc1.connect(gain);
+    osc2.connect(gain);
     gain.connect(masterGain);
 
-    osc.start(now);
-    osc.stop(now + 0.28);
+    osc1.start(now);
+    osc2.start(now);
+    osc1.stop(now + 0.30);
+    osc2.stop(now + 0.30);
   }
 
-  // =========================
-  // Helpers
-  // =========================
-  function setSegActive(){
-    segTrain.classList.toggle("active", dayType === "train");
-    segDiet.classList.toggle("active", dayType === "diet");
-    segLow.classList.toggle("active", dayType === "lowcarb");
-    saveState();
-    drawWheel();
-  }
+  // iOS unlock audio
+  document.addEventListener("touchstart", () => {
+    ensureAudio();
+    if(audioCtx && audioCtx.state === "suspended"){
+      audioCtx.resume().catch(()=>{});
+    }
+  }, { once:true, passive:true });
 
-  function clamp01(x){ return Math.min(1, Math.max(0, x)); }
-
-  function cooldownFactor(c){
-    const t = clamp01(c / RECOVERY_SPINS);
-    return PENALTY_P + (1 - PENALTY_P) * t;
-  }
-
+  // -------------------------
+  // Weighting
+  // -------------------------
   function dayMultiplier(itemType){
     if(itemType === "any") return 1;
     return (itemType === dayType) ? 2 : 1;
@@ -650,22 +667,117 @@
     return Math.max(0.05, base * dayM * aiM);
   }
 
-  function normalizeAngle(a){
-    const tau = Math.PI * 2;
-    a %= tau;
-    if(a < 0) a += tau;
-    return a;
+  function weightedPickIndex(){
+    const weights = items.map(effectiveWeight);
+    const sum = weights.reduce((a,b)=>a+b,0);
+    let r = Math.random() * sum;
+    for(let i=0;i<weights.length;i++){
+      r -= weights[i];
+      if(r <= 0) return i;
+    }
+    return weights.length - 1;
   }
 
-  // =========================
-  // Canvas casino roulette rendering
-  // =========================
+  function advanceCooldowns(){
+    for(const it of items){
+      it.cooldown = Math.min(RECOVERY_SPINS, (it.cooldown ?? RECOVERY_SPINS) + 1);
+    }
+  }
+
+  function applyPickCooldown(picked){
+    picked.cooldown = 0;
+  }
+
+  // -------------------------
+  // Advice
+  // -------------------------
+  function adviceFor(picked){
+    const pickedType = picked.type;
+    const day = dayType;
+
+    if(pickedType === "any"){
+      if(day === "train") return "通用餐可接受，你可以再補一個蛋白質小點，例如無糖豆漿或茶葉蛋。";
+      if(day === "diet") return "通用餐可接受，你可以把主食減半，並確保有一份蔬菜。";
+      return "通用餐可接受，若有主食請減量，並優先補蛋白質與蔬菜。";
+    }
+
+    if(pickedType === day){
+      if(day === "train") return "匹配訓練日，你可以把碳水放在訓練前後，並確保蛋白質至少一掌心。";
+      if(day === "diet") return "匹配減脂日，優先高蛋白與蔬菜，主食半份即可。";
+      return "匹配低碳晚餐，避免粉類與甜飲，並補足蛋白質與纖維。";
+    }
+
+    if(day === "train"){
+      if(pickedType === "lowcarb") return "你選訓練日但抽到偏低碳餐，你可以補半份主食或地瓜，再加無糖豆漿。";
+      return "你選訓練日但抽到偏減脂餐，你可以加一個蛋白質單點，並視訓練量補半份主食。";
+    }
+
+    if(day === "diet"){
+      if(pickedType === "train") return "你選減脂日但抽到偏訓練餐，你可以把主食減半，並避免額外油脂與含糖醬料。";
+      return "你選減脂日但抽到偏低碳餐，控熱量更容易，記得補足蛋白質。";
+    }
+
+    if(pickedType === "train") return "你選低碳晚餐但抽到偏訓練餐，你可以把飯或澱粉換成生菜，並以蛋白質與蔬菜為主。";
+    return "你選低碳晚餐但抽到偏減脂餐仍可接受，請把主食量降到半份或改蔬菜。";
+  }
+
+  // -------------------------
+  // Segmented control
+  // -------------------------
+  function setSegActive(){
+    segTrain.classList.toggle("active", dayType === "train");
+    segDiet.classList.toggle("active", dayType === "diet");
+    segLow.classList.toggle("active", dayType === "lowcarb");
+    saveState();
+    drawWheel();
+    renderList();
+  }
+
+  segTrain.addEventListener("click", () => { dayType = "train"; setSegActive(); });
+  segDiet.addEventListener("click", () => { dayType = "diet"; setSegActive(); });
+  segLow.addEventListener("click", () => { dayType = "lowcarb"; setSegActive(); });
+
+  // -------------------------
+  // Casino roulette rendering (keep canvas only)
+  // -------------------------
   const W = canvas.width, H = canvas.height;
   const cx = W/2, cy = H/2;
   const R = Math.min(W, H) * 0.45;
 
-  let wheelAngle = 0;      // radians
+  // Wheel & ball dynamics
+  let wheelAngle = 0;
+  let wheelOmega = 0;
+
+  let ballAngle = normalizeAngle(-Math.PI/2);
+  let ballOmega = 0;
+  let ballRadius = R + 18;
+
   let spinning = false;
+
+  function drawBall(){
+    // Draw on top after wheel
+    const x = cx + ballRadius * Math.cos(ballAngle);
+    const y = cy + ballRadius * Math.sin(ballAngle);
+
+    ctx.save();
+    // shadow
+    ctx.beginPath();
+    ctx.arc(x+6, y+6, 12, 0, Math.PI*2);
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fill();
+
+    // ball
+    const g = ctx.createRadialGradient(x-4, y-4, 2, x, y, 14);
+    g.addColorStop(0, "rgba(255,255,255,0.98)");
+    g.addColorStop(0.35, "rgba(255,255,255,0.82)");
+    g.addColorStop(1, "rgba(180,180,180,0.95)");
+    ctx.beginPath();
+    ctx.arc(x, y, 12, 0, Math.PI*2);
+    ctx.fillStyle = g;
+    ctx.fill();
+
+    ctx.restore();
+  }
 
   function drawWheel(){
     ctx.clearRect(0,0,W,H);
@@ -687,7 +799,7 @@
       return;
     }
 
-    // Background glow ring
+    // Outer glow ring
     ctx.save();
     ctx.translate(cx, cy);
     ctx.beginPath();
@@ -713,13 +825,11 @@
     ctx.fillStyle = rim;
     ctx.fill();
 
-    // Main wheel sectors
     const step = (Math.PI*2)/n;
     for(let i=0;i<n;i++){
       const a0 = i*step;
       const a1 = a0 + step;
 
-      // casino-style alternating colors
       const isRed = (i % 2 === 0);
       const baseCol = isRed ? "rgba(255,59,48,0.92)" : "rgba(20,200,120,0.88)";
       const darkCol = isRed ? "rgba(140,20,18,0.95)" : "rgba(10,90,55,0.95)";
@@ -740,7 +850,7 @@
       ctx.lineWidth = 6;
       ctx.stroke();
 
-      // numbers notch ring
+      // pocket notch ring
       ctx.save();
       ctx.rotate((a0+a1)/2);
       ctx.translate(R*0.86, 0);
@@ -753,7 +863,7 @@
       ctx.stroke();
       ctx.restore();
 
-      // text
+      // label
       ctx.save();
       ctx.rotate((a0+a1)/2);
       ctx.translate(R*0.62, 0);
@@ -800,7 +910,7 @@
 
     ctx.restore();
 
-    // Static pointer highlight line (top)
+    // pointer highlight line
     ctx.save();
     ctx.translate(cx, cy);
     ctx.strokeStyle = "rgba(255,204,0,0.22)";
@@ -810,93 +920,30 @@
     ctx.lineTo(0, -(R-12));
     ctx.stroke();
     ctx.restore();
+
+    // ball last
+    drawBall();
   }
 
-  // Pointer is at top direction (-pi/2).
-  function indexFromAngle(finalAngle){
+  function indexFromAngle(angle){
     const n = items.length;
     const step = (Math.PI*2)/n;
 
-    // wheelAngle rotates sectors, pointer fixed.
-    // local pointer position in wheel coordinates:
     const pointer = normalizeAngle(-Math.PI/2);
-    const a = normalizeAngle(finalAngle);
+    const a = normalizeAngle(angle);
     let local = pointer - a;
     local = normalizeAngle(local);
 
-    const idx = Math.floor(local / step);
-    return Math.max(0, Math.min(n-1, idx));
+    return Math.min(n-1, Math.max(0, Math.floor(local / step)));
   }
 
-  // =========================
-  // Weighted pick (AI)
-  // =========================
-  function weightedPickIndex(){
-    const weights = items.map(effectiveWeight);
-    const sum = weights.reduce((a,b)=>a+b,0);
-    let r = Math.random() * sum;
-    for(let i=0;i<weights.length;i++){
-      r -= weights[i];
-      if(r <= 0) return i;
-    }
-    return weights.length - 1;
-  }
-
-  function advanceCooldowns(){
-    for(const it of items){
-      it.cooldown = Math.min(RECOVERY_SPINS, (it.cooldown ?? RECOVERY_SPINS) + 1);
-    }
-  }
-
-  function applyPickCooldown(picked){
-    picked.cooldown = 0;
-  }
-
-  // =========================
-  // Advice logic
-  // =========================
-  function adviceFor(picked){
-    const pickedType = picked.type;
-    const day = dayType;
-
-    if(pickedType === "any"){
-      if(day === "train") return "通用餐可以接受，你可以再補一個蛋白質小點，例如無糖豆漿或茶葉蛋。";
-      if(day === "diet") return "通用餐可以接受，你可以把主食減半，並確保有一份蔬菜。";
-      return "通用餐可以接受，若有主食請減量，並優先補充蛋白質與蔬菜。";
-    }
-
-    if(pickedType === day){
-      if(day === "train") return "匹配訓練日，你可以把碳水放在訓練前後，並確保蛋白質至少一掌心。";
-      if(day === "diet") return "匹配減脂日，請優先高蛋白與蔬菜，主食半份即可。";
-      return "匹配低碳晚餐，你可以避免粉類與甜飲，並補足蛋白質與纖維。";
-    }
-
-    // mismatch
-    if(day === "train"){
-      if(pickedType === "lowcarb") return "你選的是訓練日，但抽到偏低碳餐，你可以補一份碳水與蛋白，例如地瓜或半飯，並加無糖豆漿。";
-      return "你選的是訓練日，但抽到偏減脂餐，你可以加一個蛋白質單點，並視訓練量補半份主食。";
-    }
-
-    if(day === "diet"){
-      if(pickedType === "train") return "你選的是減脂日，但抽到偏訓練餐，你可以把主食減半，並避免額外油脂與含糖醬料。";
-      return "你選的是減脂日，但抽到偏低碳餐，整體更容易控熱量，記得補足蛋白質。";
-    }
-
-    // lowcarb day
-    if(pickedType === "train") return "你選的是低碳晚餐，但抽到偏訓練餐，你可以把飯或澱粉換成生菜，並以蛋白質與蔬菜為主。";
-    return "你選的是低碳晚餐，但抽到偏減脂餐，仍可接受，請把主食量降到半份或改蔬菜。";
-  }
-
-  // =========================
-  // Spin animation (casino style)
-  // =========================
-  function easeOutQuint(x){ return 1 - Math.pow(1-x, 5); }
-
+  // -------------------------
+  // V4: Physics-like spin with deterministic landing
+  // -------------------------
   function spin(){
     if(spinning) return;
     if(items.length === 0) return;
 
-    // iOS: audio must be unlocked by user gesture
     ensureAudio();
     if(audioCtx && audioCtx.state === "suspended"){
       audioCtx.resume().catch(()=>{});
@@ -905,61 +952,98 @@
     spinning = true;
     spinBtn.disabled = true;
 
-    // AI: each spin advances cooldown, then we pick winner with weighted random.
+    // AI: advance recovery each spin, then pick weighted winner
     advanceCooldowns();
     const winnerIndex = weightedPickIndex();
 
-    // Compute final angle to land pointer in center of winner sector.
+    // Compute target wheel angle so pointer lands on winner center
     const n = items.length;
     const step = (Math.PI*2)/n;
     const pointer = normalizeAngle(-Math.PI/2);
     const winnerMid = normalizeAngle((winnerIndex + 0.5) * step);
 
-    // Need local = pointer - finalAngle = winnerMid => finalAngle = pointer - winnerMid (mod 2pi)
+    // Solve: pointer - finalAngle = winnerMid  => finalAngle = pointer - winnerMid (mod 2pi)
     let baseFinal = pointer - winnerMid;
 
-    // Add multiple turns and a small random micro-offset inside sector
-    const turns = 7 + Math.floor(Math.random()*4); // 7..10
-    const micro = (Math.random()-0.5) * step * 0.12; // tiny
+    // Add turns and micro jitter within pocket
+    const turns = 8 + Math.floor(Math.random()*4);      // 8..11
+    const micro = (Math.random()-0.5) * step * 0.10;
     const finalAngle = baseFinal + turns * Math.PI*2 + micro;
 
+    // Physics-like envelope (fast start, long coast, crisp settle)
     const startAngle = wheelAngle;
-    const delta = finalAngle - startAngle;
+    const totalDelta = finalAngle - startAngle;
 
-    const duration = 3600 + Math.floor(Math.random()*900);
+    // Wheel parameters
+    const duration = 4200 + Math.floor(Math.random()*900);
     const t0 = performance.now();
 
-    lastTickAt = 0;
+    // Ball parameters
+    const startBallAngle = ballAngle;
+    const startBallRadius = R + 22;
+
+    // Make ball run opposite wheel early, then drop into pocket
+    const ballTurns = turns + 4 + Math.floor(Math.random()*3); // more turns than wheel
+    const ballTargetWorld = normalizeAngle(-Math.PI/2); // top pointer
+    const ballTargetAngle = ballTargetWorld;            // ball is in world coords
+
+    let lastTick = 0;
+
+    function easeInOutCubic(x){
+      return x < 0.5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+    }
+    function easeOutQuint(x){
+      return 1 - Math.pow(1-x, 5);
+    }
 
     function frame(now){
       const t = (now - t0) / duration;
       const x = Math.min(1, Math.max(0, t));
-      const eased = easeOutQuint(x);
 
-      // Update angle
-      wheelAngle = startAngle + delta * eased;
+      // Wheel: long coast + settle
+      const coast = easeInOutCubic(Math.min(1, x*0.78));
+      const settle = (x > 0.78) ? easeOutQuint((x-0.78)/0.22) : 0;
+      const mix = (x <= 0.78) ? coast*0.78 : (0.78 + settle*0.22);
 
-      // Tick sound based on angular speed proxy
-      const speedProxy = (1 - x);
-      const tickInterval = 18 + 90 * (1 - speedProxy); // ms, faster early
-      if(now - lastTickAt > tickInterval){
-        lastTickAt = now;
-        clickSound(speedProxy);
+      wheelAngle = startAngle + totalDelta * mix;
+
+      // Tick sound from angular velocity proxy
+      const intensity = 1 - x;
+      const tickEvery = 18 + 95*(1 - intensity); // ms
+      if(soundOn.checked && (now - lastTick) > tickEvery){
+        lastTick = now;
+        clickSound(intensity);
       }
+
+      // Ball: world coords, spirals inward and aligns to pointer
+      const ballPhase = easeOutQuint(x);
+      const ballSpin = (ballTurns * Math.PI*2) * (1 - ballPhase); // decays
+      // Opposite direction early, then converge
+      const rawAngle = startBallAngle - ballSpin;
+      // Smoothly converge to pointer at end
+      const converge = easeOutQuint(Math.max(0, (x-0.55)/0.45));
+      const aNorm = normalizeAngle(rawAngle);
+      // shortest angle interpolation to target
+      let diff = normalizeAngle(ballTargetAngle - aNorm);
+      if(diff > Math.PI) diff -= Math.PI*2;
+      ballAngle = normalizeAngle(aNorm + diff * converge);
+
+      // Radius drops into pockets
+      ballRadius = startBallRadius - (startBallRadius - (R*0.86)) * easeOutQuint(Math.max(0, (x-0.45)/0.55));
 
       drawWheel();
 
       if(x < 1){
         requestAnimationFrame(frame);
       }else{
-        // Snap and verify index
+        // Snap to final and resolve winner
         wheelAngle = finalAngle;
+        ballAngle = ballTargetAngle;
+        ballRadius = R*0.86;
         drawWheel();
 
         const idx = indexFromAngle(wheelAngle);
-        const picked = items[idx];
-
-        // Safety: if rounding mismatch, prefer computed winnerIndex
+        const picked = items[idx] || items[winnerIndex];
         const finalPicked = items[winnerIndex] || picked;
 
         if(noRepeat.checked){
@@ -968,14 +1052,12 @@
 
         pickedText.textContent = finalPicked.name;
         adviceText.textContent = adviceFor(finalPicked);
-
         winSound();
 
         saveState();
 
         spinning = false;
         spinBtn.disabled = false;
-
         renderList();
       }
     }
@@ -983,9 +1065,9 @@
     requestAnimationFrame(frame);
   }
 
-  // =========================
-  // Editor
-  // =========================
+  // -------------------------
+  // Editor (unchanged UI)
+  // -------------------------
   function renderList(){
     listEl.innerHTML = "";
     for(const it of items){
@@ -1058,13 +1140,6 @@
     adviceText.textContent = "選好今天狀態後按 SPIN，你會得到餐點與調整建議";
   }
 
-  // =========================
-  // Wiring
-  // =========================
-  segTrain.addEventListener("click", () => { dayType = "train"; setSegActive(); });
-  segDiet.addEventListener("click", () => { dayType = "diet"; setSegActive(); });
-  segLow.addEventListener("click", () => { dayType = "lowcarb"; setSegActive(); });
-
   spinBtn.addEventListener("click", spin);
 
   editToggle.addEventListener("click", () => {
@@ -1086,21 +1161,16 @@
     if(e.key === "Enter"){ e.preventDefault(); addItem(); }
   });
 
-  // Unlock audio on first touch for iOS
-  document.addEventListener("touchstart", () => {
-    ensureAudio();
-    if(audioCtx && audioCtx.state === "suspended"){
-      audioCtx.resume().catch(()=>{});
-    }
-  }, { once:true, passive:true });
-
-  // Init UI
+  // -------------------------
+  // Init
+  // -------------------------
   setSegActive();
   renderList();
   drawWheel();
   saveState();
 
 })();
+
 </script>
 </body>
 </html>
